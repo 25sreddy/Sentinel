@@ -1,180 +1,291 @@
 import { useEffect, useState } from 'react'
 import './App.css'
 
+interface KalshiEvent {
+  id: string;
+  title: string;
+  start_date: string;
+  teamA: string;
+  teamB: string;
+}
+
 interface Market {
   ticker: string;
   title: string;
-  yes_bid_dollars: number;
-  no_bid_dollars: number;
-  volume_fp: number;
-  volume_24h_fp: number;
-  category_label?: string; // We'll add this dynamically
+  yes_sub_title: string | null;
+  series_ticker: string;
+  yes_bid_dollars: number | null;
+  no_bid_dollars: number | null;
+  volume_fp: number | null;
 }
 
 const KALSHI_API = '/api/trade-api/v2';
 
+// Infer prop type from the series ticker — no Odds API needed
+const SERIES_PROP_MAP: Record<string, string> = {
+  KXNBAGAME:   'moneyline',
+  KXNBASPREAD: 'spread',
+  KXNBATOTAL:  'total',
+  KXNBAPTS:    'points',
+  KXNBAREB:    'rebounds',
+  KXNBAAST:    'assists',
+  KXNBA3PT:    'threes',
+  KXNBABLK:    'blocks',
+  KXNBASTL:    'steals',
+  KXNBASERIES: 'series',
+};
+
+const PLAYER_PROP_TYPES = new Set(['points','rebounds','assists','threes','blocks','steals']);
+const GAME_LINE_TYPES   = new Set(['moneyline','spread','total','series']);
+
+// Parse "Team A vs Team B" titles from Kalshi event titles
+function parseTeams(title: string): [string, string] {
+  const vsMatch = title.match(/^(.+?)\s+vs\.?\s+(.+?)(?:\s+\d{4}|\s+Game|\s+Series|$)/i);
+  if (vsMatch) return [vsMatch[1].trim(), vsMatch[2].trim()];
+  return [title, ''];
+}
+
 function App() {
-  const [markets, setMarkets] = useState<Market[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [searchTerm, setSearchTerm] = useState("");
-  const [activeTab, setActiveTab] = useState("All");
+  const [events, setEvents]               = useState<KalshiEvent[]>([]);
+  const [loadingEvents, setLoadingEvents] = useState(true);
+  const [eventsError, setEventsError]     = useState<string | null>(null);
 
-  const categorizeMarket = (title: string, ticker: string): string => {
-    const t = title.toLowerCase() + " " + ticker.toLowerCase();
-    
-    if (t.includes('series') || t.includes('championship') || t.includes('finals') || t.includes('win it all')) {
-      return "Series & Futures";
-    }
-    if (t.includes('points') && (t.includes('over') || t.includes('under')) && !t.match(/(rebound|assist|block|steal|threes)/)) {
-      return "Game Lines";
-    }
-    if (t.includes('spread') || t.includes('moneyline') || t.includes('vs.')) {
-      return "Game Lines";
-    }
-    if (t.includes('pts') || t.includes('rebs') || t.includes('asts') || t.includes('points') || t.includes('rebounds') || t.includes('assists') || t.includes('threes') || t.includes('blocks') || t.includes('steals') || t.includes('+')) {
-      return "Player Props";
-    }
-    if (t.includes('triple-double') || t.includes('coach') || t.includes('sweep') || t.includes('award')) {
-      return "Milestones";
-    }
-    return "Other";
-  };
+  const [selectedEvent, setSelectedEvent] = useState<KalshiEvent | null>(null);
+  const [gameMarkets, setGameMarkets]     = useState<Market[]>([]);
+  const [loadingGame, setLoadingGame]     = useState(false);
+  const [gameError, setGameError]         = useState<string | null>(null);
 
-  const fetchNBAMarkets = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const res = await fetch(`${KALSHI_API}/markets?series_ticker=KXNBASERIES&status=open`);
-      if (!res.ok) throw new Error("Failed to fetch markets");
-      const data = await res.json();
-      
-      const enrichedMarkets = (data.markets || []).map((m: any) => ({
-        ...m,
-        category_label: categorizeMarket(m.title, m.ticker)
-      }));
-      
-      setMarkets(enrichedMarkets);
-    } catch (err: any) {
-      setError(err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
+  // ── Step 1: Fetch Kalshi game events (lightweight) ──────────────────────
   useEffect(() => {
-    fetchNBAMarkets();
-    const interval = setInterval(fetchNBAMarkets, 30000);
-    return () => clearInterval(interval);
+    const fetchEvents = async () => {
+      try {
+        setLoadingEvents(true);
+        const res = await fetch(`${KALSHI_API}/events?series_ticker=KXNBAGAME&status=open`);
+        if (!res.ok) throw new Error(`Kalshi API ${res.status}`);
+        const data = await res.json();
+        const parsed: KalshiEvent[] = (data.events || []).map((e: any) => {
+          const [teamA, teamB] = parseTeams(e.title);
+          return {
+            id: e.event_ticker,
+            title: e.title,
+            start_date: e.start_date || new Date().toISOString(),
+            teamA,
+            teamB,
+          };
+        });
+        setEvents(parsed);
+      } catch (err: any) {
+        setEventsError(err.message);
+      } finally {
+        setLoadingEvents(false);
+      }
+    };
+    fetchEvents();
   }, []);
 
-  const tabs = ["All", "Series & Futures", "Game Lines", "Player Props", "Milestones", "Other"];
+  // ── Step 2: Lazy-load markets only when a game is clicked ─────────────
+  const handleGameClick = async (event: KalshiEvent) => {
+    setSelectedEvent(event);
+    setGameMarkets([]);
+    setGameError(null);
+    setLoadingGame(true);
 
-  const filteredMarkets = markets.filter(m => {
-    const matchesSearch = m.title.toLowerCase().includes(searchTerm.toLowerCase()) || 
-                          m.ticker.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchesTab = activeTab === "All" || m.category_label === activeTab;
-    return matchesSearch && matchesTab;
-  });
+    const targetSeries = Object.keys(SERIES_PROP_MAP);
+    let all: Market[] = [];
+
+    try {
+      for (const series of targetSeries) {
+        try {
+          const res = await fetch(`${KALSHI_API}/markets?series_ticker=${series}&status=open`);
+          if (res.status === 429) { await new Promise(r => setTimeout(r, 800)); continue; }
+          if (!res.ok) continue;
+          const data = await res.json();
+          if (!data.markets) continue;
+
+          // Filter to markets relevant to this game's event ticker or team names
+          const relevant = (data.markets as any[]).filter(m => {
+            // Skip zero-volume markets
+            if (!m.volume_fp || Number(m.volume_fp) === 0) return false;
+
+            const t = m.title.toLowerCase();
+            const matchesEvent = m.event_ticker === event.id;
+            const matchesTeam  =
+              (event.teamA && t.includes(event.teamA.split(' ').slice(-1)[0].toLowerCase())) ||
+              (event.teamB && t.includes(event.teamB.split(' ').slice(-1)[0].toLowerCase()));
+            return matchesEvent || matchesTeam;
+          });
+
+          all = [...all, ...relevant.map((m: any) => ({ ...m, series_ticker: series }))];
+        } catch {
+          // skip failed series silently
+        }
+      }
+      setGameMarkets(all);
+    } catch (err: any) {
+      setGameError(err.message);
+    } finally {
+      setLoadingGame(false);
+    }
+  };
+
+  const getPropType = (m: Market) => SERIES_PROP_MAP[m.series_ticker] || 'other';
+
+  // ── Render table ─────────────────────────────────────────────────────────
+  const renderTable = (markets: Market[], propLabel: string) => (
+    <div className="market-section glass">
+      <h3 className="section-title">{propLabel}</h3>
+      <table className="props-table">
+        <thead>
+          <tr>
+            <th>Market</th>
+            <th>Detail</th>
+            <th>YES Bid</th>
+            <th>NO Bid</th>
+            <th>Implied Prob</th>
+            <th>Volume</th>
+          </tr>
+        </thead>
+        <tbody>
+          {markets.map(km => {
+            const yes = km.yes_bid_dollars != null ? Number(km.yes_bid_dollars) : null;
+            const impliedProb = yes != null ? (yes * 100).toFixed(0) + '%' : '--';
+            const vol = km.volume_fp != null ? Number(km.volume_fp).toLocaleString() : '--';
+            return (
+              <tr key={km.ticker}>
+                <td>{km.title}</td>
+                <td className="sub-title-cell">{km.yes_sub_title || '--'}</td>
+                <td className="kalshi-price yes">{yes != null ? `$${yes.toFixed(2)}` : '--'}</td>
+                <td className="kalshi-price no">
+                  {km.no_bid_dollars != null ? `$${Number(km.no_bid_dollars).toFixed(2)}` : '--'}
+                </td>
+                <td className="implied-prob">{impliedProb}</td>
+                <td className="volume-cell">{vol}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+
+  // ── Render game detail page ───────────────────────────────────────────────
+  const renderGameDetails = () => {
+    if (!selectedEvent) return null;
+
+    const gameLines   = gameMarkets.filter(m => GAME_LINE_TYPES.has(getPropType(m)));
+    const playerProps = gameMarkets.filter(m => PLAYER_PROP_TYPES.has(getPropType(m)));
+
+    // Group player props by type
+    const propGroups: Record<string, Market[]> = {};
+    for (const m of playerProps) {
+      const pt = getPropType(m);
+      propGroups[pt] = propGroups[pt] || [];
+      propGroups[pt].push(m);
+    }
+
+    const propEmoji: Record<string, string> = {
+      points: '🏀 Points', rebounds: '🔄 Rebounds', assists: '🎯 Assists',
+      threes: '3️⃣ Threes', blocks: '🛡️ Blocks', steals: '💰 Steals',
+    };
+
+    return (
+      <div className="game-details">
+        <button className="back-btn" onClick={() => { setSelectedEvent(null); setGameMarkets([]); }}>
+          ← Back to Games
+        </button>
+
+        <div className="detail-header glass">
+          <div>
+            <h2>{selectedEvent.teamA} <span className="vs-text">vs</span> {selectedEvent.teamB}</h2>
+            <span className="commence-time">
+              {new Date(selectedEvent.start_date).toLocaleString(undefined, {
+                weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+              })}
+            </span>
+          </div>
+          <div className="market-count-badge">
+            {gameMarkets.length} contracts
+          </div>
+        </div>
+
+        {loadingGame ? (
+          <div className="loading-state">
+            <div className="radar-spinner"></div>
+            <p>Fetching Kalshi markets for this game...</p>
+          </div>
+        ) : gameError ? (
+          <div className="error-state"><p>{gameError}</p></div>
+        ) : gameMarkets.length === 0 ? (
+          <div className="no-kalshi-markets glass">
+            <p>No active Kalshi contracts found for this matchup.</p>
+          </div>
+        ) : (
+          <div className="markets-container">
+            {gameLines.length > 0 && renderTable(gameLines, '🏟️ Game Lines')}
+
+            {Object.entries(propGroups).map(([pt, markets]) =>
+              renderTable(markets, propEmoji[pt] || pt)
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // ── Render game lobby ─────────────────────────────────────────────────────
+  const renderGameList = () => (
+    <div className="game-grid">
+      {events.map(game => (
+        <div
+          key={game.id}
+          className="game-card glass interactive"
+          onClick={() => handleGameClick(game)}
+        >
+          <div className="game-card-content">
+            <h3>{game.teamA}</h3>
+            <div className="vs-badge">VS</div>
+            <h3>{game.teamB}</h3>
+          </div>
+          <div className="game-card-footer">
+            <span>{new Date(game.start_date).toLocaleString(undefined, {
+              month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+            })}</span>
+            <span className="view-btn">View Markets →</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 
   return (
     <div className="dashboard">
       <header className="header">
         <div className="header-content">
-          <h1>
-            <span className="gradient-text">NBA</span> Risk Graph
-          </h1>
-          <p className="subtitle">Real-time dependency mapping of sports derivatives</p>
-        </div>
-        <div className="header-actions">
-          <input
-            type="text"
-            placeholder="Search markets..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
-            className="search-bar"
-          />
-          <button className="refresh-btn" onClick={fetchNBAMarkets} disabled={loading}>
-            {loading ? <span className="spinner"></span> : "Refresh Live"}
-          </button>
+          <h1><span className="gradient-text">NBA</span> Risk Graph</h1>
+          <p className="subtitle">Kalshi-only · Click a game to explore its markets</p>
         </div>
       </header>
 
-      <div className="tabs-container">
-        {tabs.map(tab => (
-          <button 
-            key={tab} 
-            className={`tab-btn ${activeTab === tab ? 'active' : ''}`}
-            onClick={() => setActiveTab(tab)}
-          >
-            {tab}
-            {tab !== "All" && (
-              <span className="tab-count">
-                {markets.filter(m => m.category_label === tab).length}
-              </span>
-            )}
-          </button>
-        ))}
-      </div>
-
       <main className="main-content">
-        {loading && markets.length === 0 ? (
-          <div className="loading-state">
-            <div className="radar-spinner"></div>
-            <p>Scanning active NBA market events...</p>
-          </div>
-        ) : error ? (
-          <div className="error-state">
-            <p>Connection Error: {error}</p>
-          </div>
-        ) : filteredMarkets.length === 0 ? (
-          <div className="empty-state">
-            <div className="empty-icon">🏀</div>
-            <h2>No {activeTab} markets found</h2>
-            <p>There are currently no active markets fitting this risk cluster. Try another tab or clear your search.</p>
-          </div>
-        ) : (
-          <div className="grid">
-            {filteredMarkets.map((market) => (
-              <div key={market.ticker} className="card glass">
-                <div className="card-header">
-                  <span className="ticker">{market.ticker}</span>
-                  <span className="volume">Vol: {(market.volume_fp / 100000).toFixed(1)}k</span>
-                </div>
-                <h3 className="card-title">{market.title}</h3>
-
-                <div className="price-container">
-                  <div className="price-box yes">
-                    <span className="price-label">YES</span>
-                    <span className="price-value">
-                      ${market.yes_bid_dollars != null ? Number(market.yes_bid_dollars).toFixed(2) : '--'}
-                    </span>
-                  </div>
-                  <div className="price-box no">
-                    <span className="price-label">NO</span>
-                    <span className="price-value">
-                      ${market.no_bid_dollars != null ? Number(market.no_bid_dollars).toFixed(2) : '--'}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="probability-bar">
-                  <div
-                    className="probability-fill"
-                    style={{ width: `${Number(market.yes_bid_dollars || 0) * 100}%` }}
-                  ></div>
-                </div>
-                <div className="probability-labels">
-                  <span>{(Number(market.yes_bid_dollars || 0) * 100).toFixed(0)}% Implied</span>
-                  <span>{(Number(market.no_bid_dollars || 0) * 100).toFixed(0)}% Implied</span>
-                </div>
-              </div>
-            ))}
-          </div>
+        {selectedEvent ? renderGameDetails() : (
+          loadingEvents ? (
+            <div className="loading-state">
+              <div className="radar-spinner"></div>
+              <p>Fetching upcoming NBA games from Kalshi...</p>
+            </div>
+          ) : eventsError ? (
+            <div className="error-state"><p>Error: {eventsError}</p></div>
+          ) : events.length === 0 ? (
+            <div className="empty-state">
+              <div className="empty-icon">🏀</div>
+              <h2>No NBA Games Found</h2>
+              <p>No upcoming games at the moment. Check back soon.</p>
+            </div>
+          ) : renderGameList()
         )}
       </main>
     </div>
-  )
+  );
 }
 
 export default App

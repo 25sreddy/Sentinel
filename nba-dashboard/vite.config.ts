@@ -10,6 +10,11 @@ export default defineConfig({
         target: 'https://external-api.kalshi.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
+      },
+      '/odds': {
+        target: 'https://api.the-odds-api.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/odds/, '')
       }
     }
   }

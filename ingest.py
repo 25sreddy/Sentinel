@@ -70,8 +70,11 @@ def fetch_markets_for_event(event_ticker):
 def main():
     conn = init_db()
     
-    # Target series from the project overview + an actively trading one for testing
-    series_tickers = ["KXNBASERIES", "NFL", "KXHIGHNY"]
+    # Target series from the Kalshi taxonomy structure
+    series_tickers = [
+        "KXNBASERIES", "KXNBAGAME", "KXNBASPREAD", "KXNBATOTAL", 
+        "KXNBAPTS", "KXNBAREB", "KXNBAAST", "KXNBA3PT", "KXNBABLK", "KXNBASTL"
+    ]
     timestamp = datetime.now()
     
     for series in series_tickers:
